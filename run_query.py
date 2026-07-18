@@ -6,7 +6,7 @@ engine = create_engine("sqlite:///data/chinook.db")
 
 
 def run_sql(sql):
-    """Execute a SQL query and return the rows (or an error message)."""
+    """Execute a SQL query and return (columns, rows) or (None, error_message)."""
     try:
         with engine.connect() as conn:
             result = conn.execute(text(sql))
@@ -14,22 +14,30 @@ def run_sql(sql):
             columns = list(result.keys())
             return columns, rows
     except Exception as e:
-        # If the SQL is invalid, return the error instead of crashing
         return None, str(e)
 
 
 def ask(question):
-    """Full pipeline: question -> SQL -> execution -> printed result."""
+    """Full pipeline: question -> model -> (SQL + result) OR clarification."""
     print(f"QUESTION: {question}")
 
-    # Step 1: model generates SQL
-    sql = generate_sql(question)
+    # The model now returns a dict: either a SQL answer or a clarification.
+    result = generate_sql(question)
+
+    # Case 1: the question was ambiguous -> show the clarification request
+    if result["type"] == "clarification":
+        print("NEEDS CLARIFICATION:")
+        print(f"  {result['question']}")
+        for opt in result["options"]:
+            print(f"   - {opt}")
+        print("-" * 60)
+        return
+
+    # Case 2: we got SQL -> run it and show the result
+    sql = result["sql"]
     print(f"SQL:\n{sql}")
 
-    # Step 2: run the SQL on the database
     columns, rows = run_sql(sql)
-
-    # Step 3: show the result
     if columns is None:
         print(f"ERROR: {rows}")
     else:
@@ -41,5 +49,5 @@ def ask(question):
 
 if __name__ == "__main__":
     ask("How many customers are there?")
-    ask("List the top 5 artists with the most albums.")
-    ask("What is the total revenue from invoices in the USA?")
+    ask("Which 3 countries generate the most revenue?")
+    ask("Who is our best customer?")  # should show clarification, not run SQL
