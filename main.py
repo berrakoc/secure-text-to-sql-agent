@@ -3,12 +3,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-client = OpenAI()  # .env'deki OPENAI_API_KEY'i otomatik okur
+client = OpenAI()  # automatically reads OPENAI_API_KEY from .env
 
 response = client.chat.completions.create(
     model="gpt-4o-mini",
     messages=[
-        {"role": "user", "content": "Merhaba! Sadece 'Bağlantı başarılı ✅' yaz."}
+        {"role": "user", "content": "Hello! Please reply with only 'Connection successful ✅'."}
     ]
 )
 
