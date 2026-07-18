@@ -1,10 +1,13 @@
 from openai import OpenAI
 from dotenv import load_dotenv
 from schema import build_schema_text
+from schema_filter import get_relevant_tables  # NEW: table filtering
 
-# Load API key from .env
 load_dotenv()
 client = OpenAI()
+
+# NOTE: No longer build one fixed schema. The schema is now built
+# per question, using only the tables relevant to that question.
 
 # Build the schema text once (reused for every question)
 SCHEMA_TEXT = build_schema_text()
@@ -51,7 +54,13 @@ FEW_SHOT_EXAMPLES = [
 
 def build_messages(question):
     """Assemble the full message list: system prompt + few-shot examples
-    + the user's actual question."""
+    + the user's actual question. The schema is filtered to relevant tables."""
+
+    # Pick only the tables relevant to this question
+    relevant_tables = get_relevant_tables(question, top_n=4)
+
+    # Build schema text using just those tables
+    schema_text = build_schema_text(only_tables=relevant_tables)
 
     system_prompt = f"""You are an expert SQL assistant for a SQLite database.
 Given a question, write a single valid SQLite SQL query that answers it.
@@ -63,18 +72,15 @@ Rules:
 - Use the example values to match real values in the data.
 
 Database schema:
-{SCHEMA_TEXT}
+{schema_text}
 """
 
-    # Start with the system message
     messages = [{"role": "system", "content": system_prompt}]
 
-    # Add each few-shot example as a fake user/assistant exchange
     for ex in FEW_SHOT_EXAMPLES:
         messages.append({"role": "user", "content": ex["question"]})
         messages.append({"role": "assistant", "content": ex["sql"]})
 
-    # Finally add the real question
     messages.append({"role": "user", "content": question})
 
     return messages

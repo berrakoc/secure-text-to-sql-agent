@@ -34,13 +34,16 @@ CATEGORICAL_COLUMNS = {
 }
 
 
-def build_schema_text():
-    """Read the database structure and return it as CREATE TABLE style text,
-    including sample values for categorical columns."""
+def build_schema_text(only_tables=None):
+    """Read the database structure and return it as CREATE TABLE style text.
+    If only_tables is given, include just those tables; otherwise include all."""
 
     schema_lines = []
 
-    for table in inspector.get_table_names():
+    # Decide which tables to include
+    tables_to_use = only_tables if only_tables else inspector.get_table_names()
+
+    for table in tables_to_use:
         schema_lines.append(f"CREATE TABLE {table} (")
 
         col_defs = []
