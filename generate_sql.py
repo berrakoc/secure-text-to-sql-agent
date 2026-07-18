@@ -9,11 +9,50 @@ client = OpenAI()
 # Build the schema text once (reused for every question)
 SCHEMA_TEXT = build_schema_text()
 
+# Few-shot examples: question -> correct SQL, specific to the Chinook schema.
+# These teach the model the expected style (JOINs, naming, LIMIT).
+FEW_SHOT_EXAMPLES = [
+    {
+        "question": "How many tracks are there in total?",
+        "sql": "SELECT COUNT(*) FROM Track;",
+    },
+    {
+        "question": "List the top 5 artists with the most albums.",
+        "sql": (
+            "SELECT Artist.Name, COUNT(Album.AlbumId) AS AlbumCount\n"
+            "FROM Artist\n"
+            "JOIN Album ON Artist.ArtistId = Album.ArtistId\n"
+            "GROUP BY Artist.ArtistId\n"
+            "ORDER BY AlbumCount DESC\n"
+            "LIMIT 5;"
+        ),
+    },
+    {
+        "question": "What is the total revenue from customers in the USA?",
+        "sql": (
+            "SELECT SUM(Invoice.Total) AS TotalRevenue\n"
+            "FROM Invoice\n"
+            "WHERE Invoice.BillingCountry = 'USA';"
+        ),
+    },
+    {
+        "question": "Which genre has the most tracks?",
+        "sql": (
+            "SELECT Genre.Name, COUNT(Track.TrackId) AS TrackCount\n"
+            "FROM Genre\n"
+            "JOIN Track ON Genre.GenreId = Track.GenreId\n"
+            "GROUP BY Genre.GenreId\n"
+            "ORDER BY TrackCount DESC\n"
+            "LIMIT 1;"
+        ),
+    },
+]
 
-def generate_sql(question):
-    """Take a natural language question and return a SQL query as text."""
 
-    # The system prompt tells the model its role and gives it the schema
+def build_messages(question):
+    """Assemble the full message list: system prompt + few-shot examples
+    + the user's actual question."""
+
     system_prompt = f"""You are an expert SQL assistant for a SQLite database.
 Given a question, write a single valid SQLite SQL query that answers it.
 
@@ -21,32 +60,43 @@ Rules:
 - Only use tables and columns that exist in the schema below.
 - Return ONLY the SQL query, no explanation, no markdown code fences.
 - Use the foreign key hints (-- ... refers to ...) to write correct JOINs.
+- Use the example values to match real values in the data.
 
 Database schema:
 {SCHEMA_TEXT}
 """
 
-    # Send the question to the model
+    # Start with the system message
+    messages = [{"role": "system", "content": system_prompt}]
+
+    # Add each few-shot example as a fake user/assistant exchange
+    for ex in FEW_SHOT_EXAMPLES:
+        messages.append({"role": "user", "content": ex["question"]})
+        messages.append({"role": "assistant", "content": ex["sql"]})
+
+    # Finally add the real question
+    messages.append({"role": "user", "content": question})
+
+    return messages
+
+
+def generate_sql(question):
+    """Take a natural language question and return a SQL query as text."""
     response = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": question},
-        ],
-        temperature=0,  # deterministic output for SQL
+        messages=build_messages(question),
+        temperature=0,
     )
-
     return response.choices[0].message.content.strip()
 
 
-# Quick test with a few questions
+# Quick test — including a harder question not covered by the examples
 if __name__ == "__main__":
     questions = [
         "How many customers are there?",
-        "List the top 5 artists with the most albums.",
-        "What is the total revenue from invoices in the USA?",
+        "Which 3 countries generate the most revenue?",
+        "List the names of tracks longer than 5 minutes.",
     ]
-
     for q in questions:
         print(f"QUESTION: {q}")
         print(generate_sql(q))
