@@ -1,9 +1,7 @@
+import time
 from sqlalchemy import create_engine, text
 
-# Read-only connection to SQLite.
-# 'mode=ro' opens the database file in read-only mode at the driver level:
-# even if a write query somehow slips through, the database refuses it.
-# This is our second, independent line of defense (defense in depth).
+# Read-only connection to SQLite (second line of defense).
 READONLY_ENGINE = create_engine(
     "sqlite:///file:data/chinook.db?mode=ro&uri=true"
 )
@@ -11,32 +9,46 @@ READONLY_ENGINE = create_engine(
 
 def run_readonly(sql):
     """Execute a SQL query on a strictly read-only connection.
+    Also measures execution time and captures the query plan (EXPLAIN).
 
-    Returns a dict:
-      {"success": True,  "columns": [...], "rows": [...]}
-      {"success": False, "error": "<message>"}
-    """
+    Returns a dict with success, columns, rows, row_count, elapsed_ms, plan
+    (or success=False with an error message)."""
     try:
         with READONLY_ENGINE.connect() as conn:
+            # Measure how long the query takes to run
+            start = time.perf_counter()
             result = conn.execute(text(sql))
             columns = list(result.keys())
             rows = result.fetchall()
-            return {"success": True, "columns": columns, "rows": rows}
+            elapsed_ms = (time.perf_counter() - start) * 1000
+
+            # Capture the query plan (how SQLite will execute this query)
+            plan = get_query_plan(conn, sql)
+
+            return {
+                "success": True,
+                "columns": columns,
+                "rows": rows,
+                "row_count": len(rows),
+                "elapsed_ms": round(elapsed_ms, 2),
+                "plan": plan,
+            }
     except Exception as e:
-        # Any error (including a blocked write) lands here instead of crashing.
         return {"success": False, "error": str(e)}
 
 
-# Quick test: a safe read, then prove writes are physically rejected.
-if __name__ == "__main__":
-    # 1. A normal read should work
-    print("READ TEST:")
-    result = run_readonly("SELECT COUNT(*) FROM Customer;")
-    print(result)
-    print()
+def get_query_plan(conn, sql):
+    """Ask SQLite how it plans to run the query (its EXPLAIN QUERY PLAN).
+    Useful for auditability and for spotting expensive full-table scans."""
+    try:
+        plan_rows = conn.execute(
+            text(f"EXPLAIN QUERY PLAN {sql}")
+        ).fetchall()
+        # Each row's last field is a human-readable step description
+        return [row[-1] for row in plan_rows]
+    except Exception:
+        return []
 
-    # 2. A write should be refused by the read-only connection itself,
-    #    even though no guardrail is involved here.
-    print("WRITE TEST (should fail at the connection level):")
-    result = run_readonly("DELETE FROM Customer WHERE CustomerId = 1;")
-    print(result)
+
+if __name__ == "__main__":
+    print(run_readonly("SELECT COUNT(*) FROM Customer;"))
