@@ -1,4 +1,5 @@
 import json
+import sqlparse
 from openai import OpenAI
 from dotenv import load_dotenv
 from schema import build_schema_text
@@ -7,26 +8,18 @@ from schema_filter import get_relevant_tables
 load_dotenv()
 client = OpenAI()
 
-# Few-shot examples now include the JSON shape we want the model to produce.
-# Most are normal SQL answers; the last one shows how to ask for clarification
-# when a question is ambiguous.
+# Few-shot examples now include the richer output shape:
+# sql + explanation + confidence + the tables the query uses.
+# The last example shows the clarification shape for ambiguous questions.
 FEW_SHOT_EXAMPLES = [
     {
         "question": "How many tracks are there in total?",
-        "answer": {"type": "sql", "sql": "SELECT COUNT(*) FROM Track;"},
-    },
-    {
-        "question": "List the top 5 artists with the most albums.",
         "answer": {
             "type": "sql",
-            "sql": (
-                "SELECT Artist.Name, COUNT(Album.AlbumId) AS AlbumCount\n"
-                "FROM Artist\n"
-                "JOIN Album ON Artist.ArtistId = Album.ArtistId\n"
-                "GROUP BY Artist.ArtistId\n"
-                "ORDER BY AlbumCount DESC\n"
-                "LIMIT 5;"
-            ),
+            "sql": "SELECT COUNT(*) FROM Track;",
+            "explanation": "Counts all rows in the Track table.",
+            "confidence": 0.98,
+            "tables_used": ["Track"],
         },
     },
     {
@@ -38,11 +31,13 @@ FEW_SHOT_EXAMPLES = [
                 "FROM Invoice\n"
                 "WHERE Invoice.BillingCountry = 'USA';"
             ),
+            "explanation": "Sums invoice totals where the billing country is the USA.",
+            "confidence": 0.95,
+            "tables_used": ["Invoice"],
         },
     },
     {
-        # Ambiguous example: "best customer" could mean several things.
-        # The model should ask instead of guessing.
+        # Ambiguous question -> ask instead of guessing.
         "question": "Who is our best customer?",
         "answer": {
             "type": "clarification",
@@ -61,7 +56,6 @@ def build_messages(question):
     """Assemble the message list: system prompt + few-shot examples + question.
     The schema is filtered to the tables relevant to this question."""
 
-    # Pick only the tables relevant to this question
     relevant_tables = get_relevant_tables(question, top_n=4)
     schema_text = build_schema_text(only_tables=relevant_tables)
 
@@ -69,15 +63,22 @@ def build_messages(question):
 
 For each question, respond with a JSON object in one of two shapes:
 
-1. If the question is clear, return SQL:
-   {{"type": "sql", "sql": "<a single valid SQLite query>"}}
+1. If the question is clear, return SQL with metadata:
+   {{"type": "sql",
+     "sql": "<a single valid SQLite SELECT query>",
+     "explanation": "<one short sentence describing what the query does>",
+     "confidence": <a number from 0 to 1 for how sure you are>,
+     "tables_used": ["<table names the query reads from>"]}}
 
 2. If the question is ambiguous (could reasonably mean different things),
    do NOT guess. Ask for clarification:
-   {{"type": "clarification", "question": "<what is unclear>", "options": ["<option 1>", "<option 2>"]}}
+   {{"type": "clarification",
+     "question": "<what is unclear>",
+     "options": ["<option 1>", "<option 2>"]}}
 
 Rules:
 - Only use tables and columns that exist in the schema below.
+- Only generate read-only SELECT queries. Never write or change data.
 - Use the foreign key hints (-- ... refers to ...) to write correct JOINs.
 - Use the example values to match real values in the data.
 - Return ONLY the JSON object, nothing else.
@@ -88,7 +89,6 @@ Database schema:
 
     messages = [{"role": "system", "content": system_prompt}]
 
-    # Add each few-shot example, with the answer serialized as JSON text
     for ex in FEW_SHOT_EXAMPLES:
         messages.append({"role": "user", "content": ex["question"]})
         messages.append({"role": "assistant", "content": json.dumps(ex["answer"])})
@@ -97,24 +97,53 @@ Database schema:
     return messages
 
 
+def validate_sql_syntax(sql):
+    """Basic syntax/type check with sqlparse, before the query is ever run.
+    Returns a dict: is it parseable, what statement type is it (SELECT/DROP/...),
+    and whether it contains more than one statement.
+    This is the first brick of the safety layer built in the next step."""
+
+    parsed = sqlparse.parse(sql)
+
+    # Keep only non-empty statements (ignores a trailing ';')
+    statements = [s for s in parsed if str(s).strip()]
+
+    if not statements:
+        return {"valid": False, "statement_type": None,
+                "message": "Empty or unparseable SQL"}
+
+    # Multiple statements (e.g. "SELECT ...; DROP ...") is a classic
+    # injection pattern -> reject early.
+    if len(statements) > 1:
+        return {"valid": False, "statement_type": None,
+                "message": "Multiple SQL statements are not allowed"}
+
+    # Identify the statement type: SELECT, INSERT, UPDATE, DELETE, DROP, ...
+    stmt_type = statements[0].get_type()
+
+    if stmt_type == "UNKNOWN":
+        return {"valid": False, "statement_type": None,
+                "message": "Could not determine statement type"}
+
+    return {"valid": True, "statement_type": stmt_type, "message": "OK"}
+
+
 def generate_sql(question):
     """Take a question and return a parsed dict:
-    either {"type": "sql", ...} or {"type": "clarification", ...}."""
+    either a rich SQL answer or a clarification request."""
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=build_messages(question),
         temperature=0,
-        response_format={"type": "json_object"},  # force valid JSON output
+        response_format={"type": "json_object"},
     )
-    # Parse the JSON string into a Python dict
     return json.loads(response.choices[0].message.content)
 
 
-# Quick test: two clear questions and one ambiguous one
+# Quick test
 if __name__ == "__main__":
     questions = [
         "How many customers are there?",
-        "Which 3 countries generate the most revenue?",
         "Who is our best customer?",  # should trigger clarification
     ]
     for q in questions:
@@ -122,12 +151,21 @@ if __name__ == "__main__":
         result = generate_sql(q)
 
         if result["type"] == "sql":
-            print("SQL:")
-            print(result["sql"])
+            print("SQL:", result["sql"])
+            print("EXPLANATION:", result["explanation"])
+            print("CONFIDENCE:", result["confidence"])
+            print("TABLES USED:", result["tables_used"])
+            # Run the new syntax check on the generated SQL
+            check = validate_sql_syntax(result["sql"])
+            print("SYNTAX CHECK:", check)
         elif result["type"] == "clarification":
-            print("NEEDS CLARIFICATION:")
-            print(f"  {result['question']}")
+            print("NEEDS CLARIFICATION:", result["question"])
             for opt in result["options"]:
-                print(f"   - {opt}")
-
+                print("  -", opt)
         print("-" * 60)
+
+    # Bonus: prove the syntax checker can spot a dangerous statement type.
+    # (The model won't produce this, but the safety layer will inspect such
+    #  strings in the next step.)
+    print("DANGEROUS SQL TEST:")
+    print(validate_sql_syntax("DROP TABLE Album;"))
