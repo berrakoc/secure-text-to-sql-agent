@@ -43,7 +43,7 @@ TABLE_EMBEDDINGS = {
 }
 
 
-def get_relevant_tables(question, top_n=4):
+def get_relevant_tables(question, top_n=4, debug=False):
     """Return the top_n table names most relevant to the question,
     ranked by cosine similarity between the question and each table."""
     question_vec = embed_text(question)
@@ -57,9 +57,11 @@ def get_relevant_tables(question, top_n=4):
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
     # Print scores so we can see what the filter is doing
-    print("Table relevance scores:")
-    for table, score in ranked:
-        print(f"  {table}: {score:.3f}")
+    # Optional debug output (off by default so the API stays quiet)
+    if debug:
+        print("Table relevance scores:")
+        for table, score in ranked:
+            print(f"  {table}: {score:.3f}")
 
     # Return just the top_n table names
     return [table for table, score in ranked[:top_n]]

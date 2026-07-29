@@ -19,7 +19,9 @@ def run_readonly(sql):
             start = time.perf_counter()
             result = conn.execute(text(sql))
             columns = list(result.keys())
-            rows = result.fetchall()
+            # Convert SQLAlchemy Row objects into plain lists so the result
+            # can be serialized to JSON (needed by the API layer).
+            rows = [list(row) for row in result.fetchall()]
             elapsed_ms = (time.perf_counter() - start) * 1000
 
             # Capture the query plan (how SQLite will execute this query)
