@@ -4,6 +4,9 @@ from pydantic import BaseModel
 from pipeline import answer_question
 from db.schema import build_schema_text
 
+import json
+import os
+
 # Create the FastAPI application
 app = FastAPI(title="Text-to-SQL API")
 
@@ -15,6 +18,11 @@ HISTORY = []
 
 class QueryRequest(BaseModel):
     question: str
+
+class FeedbackRequest(BaseModel):
+    question: str
+    sql: str
+    is_correct: bool  # True = thumbs up, False = thumbs down
 
 
 @app.get("/")
@@ -50,3 +58,25 @@ def schema():
 def history():
     """Return the list of questions asked in this session, newest first."""
     return {"history": list(reversed(HISTORY))}
+
+# File where feedback is stored, one JSON object per line (JSONL).
+FEEDBACK_FILE = "feedback.jsonl"
+
+
+@app.post("/feedback")
+def feedback(request: FeedbackRequest):
+    """Store user feedback on a query result.
+    Correct results can later become few-shot examples;
+    incorrect ones become test cases for the eval suite. This is the flywheel."""
+
+    entry = {
+        "question": request.question,
+        "sql": request.sql,
+        "is_correct": request.is_correct,
+    }
+
+    # Append one JSON line to the feedback file.
+    with open(FEEDBACK_FILE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+    return {"status": "recorded", "is_correct": request.is_correct}
