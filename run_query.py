@@ -1,5 +1,5 @@
 from sqlalchemy import create_engine, text
-from generate_sql import generate_sql
+from generation.generate_sql import generate_sql
 
 # Connect to the same SQLite database
 engine = create_engine("sqlite:///data/chinook.db")

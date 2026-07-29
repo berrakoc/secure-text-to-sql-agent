@@ -1,6 +1,6 @@
 from pipeline import answer_question, print_result
-from guardrails import check_query, BLOCKED_LOG
-from execute import run_readonly
+from safety.guardrails import check_query, BLOCKED_LOG
+from safety.execute import run_readonly
 
 
 def test_raw_sql_injection():

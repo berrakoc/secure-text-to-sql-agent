@@ -1,6 +1,12 @@
-from generate_sql import generate_sql, validate_sql_syntax
-from guardrails import check_query
-from execute import run_readonly
+from generation.generate_sql import generate_sql, validate_sql_syntax
+from safety.guardrails import check_query
+from safety.execute import run_readonly
+from detection.verify import (
+    verify_sql_matches_question,
+    sanity_check_result,
+    compute_confidence,
+    multi_query_validation,
+)
 
 
 def answer_question(question):
@@ -45,13 +51,33 @@ def answer_question(question):
     if not execution["success"]:
         return {"status": "error", "sql": safe_sql, "reason": execution["error"]}
 
+    # Step 5b: run hallucination-detection checks (Phase 3)
+    # Signal 1: does the SQL back-translate to the original question?
+    verification = verify_sql_matches_question(question, safe_sql)
+    # Signal 2: does the result look sane? (cheap, no LLM)
+    sanity_flags = sanity_check_result(execution, safe_sql)
+    # Signal 3: for complex queries, cross-check with an independent query.
+    multi_query = multi_query_validation(question, safe_sql, execution)
+    # Combine all signals into a real, explainable confidence score.
+    scoring = compute_confidence(
+        syntax_valid=syntax["valid"],
+        alignment_similarity=verification["similarity"],
+        sanity_flags=sanity_flags,
+        multi_query=multi_query,
+    )
+
     # Step 6: package everything together
     return {
         "status": "success",
         "question": question,
         "sql": safe_sql,
         "explanation": generated.get("explanation"),
-        "confidence": generated.get("confidence"),
+        # Real computed confidence replaces the model's self-reported one
+        "confidence": scoring["confidence"],
+        "confidence_breakdown": scoring["breakdown"],
+        "back_translated_question": verification["back_translated"],
+        "sanity_flags": sanity_flags,
+        "multi_query_check": multi_query["detail"],
         "tables_used": generated.get("tables_used"),
         "columns": execution["columns"],
         "rows": execution["rows"],
@@ -81,10 +107,14 @@ def print_result(result):
     elif status == "success":
         print("SQL:", result["sql"])
         print("EXPLANATION:", result["explanation"])
-        print("CONFIDENCE:", result["confidence"])
+        print(f"CONFIDENCE: {result['confidence']}  breakdown={result['confidence_breakdown']}")
+        print("BACK-TRANSLATED:", result["back_translated_question"])
+        print("MULTI-QUERY:", result["multi_query_check"])
+        if result["sanity_flags"]:
+            print("SANITY FLAGS:", result["sanity_flags"])
         print(f"RESULT ({result['row_count']} rows, {result['elapsed_ms']} ms):")
         print("  COLUMNS:", result["columns"])
-        for row in result["rows"][:10]:  # show at most 10 rows
+        for row in result["rows"][:10]:
             print("  ", row)
 
 

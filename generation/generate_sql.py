@@ -2,8 +2,8 @@ import json
 import sqlparse
 from openai import OpenAI
 from dotenv import load_dotenv
-from schema import build_schema_text
-from schema_filter import get_relevant_tables
+from db.schema import build_schema_text
+from db.schema_filter import get_relevant_tables
 
 load_dotenv()
 client = OpenAI()

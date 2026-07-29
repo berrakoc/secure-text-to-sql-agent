@@ -2,7 +2,11 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 # Reuse the embedding + similarity helpers we already built in Phase 1.
-from schema_filter import embed_text, cosine_similarity
+from db.schema_filter import embed_text, cosine_similarity
+
+# Add these to the imports at the top of verify.py
+from generation.generate_sql import generate_sql
+from safety.execute import run_readonly
 
 load_dotenv()
 client = OpenAI()
@@ -103,46 +107,120 @@ def sanity_check_result(execution_result, sql):
 
     return flags
 
-def compute_confidence(syntax_valid, alignment_similarity, sanity_flags):
+def compute_confidence(syntax_valid, alignment_similarity, sanity_flags,
+                       multi_query=None):
     """Combine independent signals into a single confidence score (0 to 1).
 
     Signals:
       - syntax_valid: bool, did the SQL pass the syntax/type check?
-      - alignment_similarity: float 0-1, how well the SQL back-translates
-        to the original question (from Madde 1)
-      - sanity_flags: list of warnings from the sanity checks (Madde 2);
-        more flags -> lower confidence
+      - alignment_similarity: float 0-1, SQL-to-question back-translation match
+      - sanity_flags: list of sanity warnings (more flags -> lower confidence)
+      - multi_query: optional dict from multi_query_validation().
+        If two independent queries agreed -> boost; if they disagreed -> penalty;
+        if it wasn't run -> no effect.
 
-    Returns a dict with the final score and a breakdown of each part,
-    so the score is explainable rather than a mysterious number."""
+    Returns the final score plus an explainable breakdown."""
 
-    # 1. Syntax signal: valid = full marks, invalid = zero.
     syntax_score = 1.0 if syntax_valid else 0.0
-
-    # 2. Alignment signal: use the similarity directly (already 0-1).
     alignment_score = float(alignment_similarity)
-
-    # 3. Sanity signal: start at 1.0, subtract a penalty per flag.
-    #    Each flag costs 0.25; floor at 0 so it never goes negative.
     sanity_score = max(0.0, 1.0 - 0.25 * len(sanity_flags))
 
-    # Weighted combination. Alignment matters most (does the SQL answer
-    # the right question?), then sanity, then syntax as a basic gate.
+    # Base weighted combination of the three always-available signals.
     weights = {"syntax": 0.2, "alignment": 0.5, "sanity": 0.3}
-    final = (
+    base = (
         weights["syntax"] * syntax_score
         + weights["alignment"] * alignment_score
         + weights["sanity"] * sanity_score
     )
 
+    # Multi-query adjustment (only if it actually ran).
+    multi_query_effect = "not run"
+    if multi_query and multi_query.get("checked"):
+        if multi_query.get("agrees"):
+            # Two independent queries agreed -> nudge confidence up.
+            base = base + 0.1 * (1.0 - base)  # move 10% toward 1.0
+            multi_query_effect = "agreed (boosted)"
+        else:
+            # They disagreed -> strong doubt, cut confidence.
+            base = base * 0.5
+            multi_query_effect = "disagreed (penalized)"
+
     return {
-        "confidence": round(final, 3),
+        "confidence": round(base, 3),
         "breakdown": {
             "syntax_score": round(syntax_score, 3),
             "alignment_score": round(alignment_score, 3),
             "sanity_score": round(sanity_score, 3),
+            "multi_query": multi_query_effect,
         },
     }
+
+def is_complex_question(sql):
+    """Cheap heuristic: is this query complex enough to be worth a second,
+    independent check? We only run the expensive multi-query validation
+    on queries that join tables or aggregate — simple lookups are skipped."""
+    sql_upper = sql.upper()
+    signals = ("JOIN", "GROUP BY", "HAVING", "UNION")
+    return any(s in sql_upper for s in signals)
+
+
+def generate_alternative_sql(question):
+    """Ask the model to answer the same question with a DIFFERENT SQL approach.
+    We nudge it to vary its strategy so the two queries are truly independent."""
+    hint = (
+        question
+        + "\n\n(Write the SQL using a different approach than usual — "
+        "for example a subquery instead of a JOIN, or a different "
+        "aggregation strategy. The result must still be correct.)"
+    )
+    result = generate_sql(hint)
+    # The model might return a clarification; only proceed if it gave SQL.
+    if result.get("type") == "sql":
+        return result["sql"]
+    return None
+
+
+def multi_query_validation(question, primary_sql, primary_result):
+    """Run a second, independently-generated query and compare results.
+
+    Returns a dict:
+      - checked: was multi-query validation actually run?
+      - agrees: did the two approaches produce the same result?
+      - detail: human-readable explanation
+
+    primary_result is the dict from run_readonly() for the first query."""
+
+    # Skip cheap/simple queries entirely
+    if not is_complex_question(primary_sql):
+        return {"checked": False, "agrees": None,
+                "detail": "Simple query — multi-query validation skipped"}
+
+    # Generate a second SQL with a different approach
+    alt_sql = generate_alternative_sql(question)
+    if alt_sql is None:
+        return {"checked": False, "agrees": None,
+                "detail": "Could not generate an alternative query"}
+
+    # Run the alternative query (read-only, like everything else)
+    alt_result = run_readonly(alt_sql)
+    if not alt_result["success"]:
+        return {"checked": True, "agrees": False,
+                "detail": f"Alternative query failed to run: {alt_result['error'][:60]}"}
+
+    # Compare the two result sets. We sort rows so that ordering
+    # differences don't count as disagreement (same data, different order).
+    primary_rows = sorted(str(r) for r in primary_result["rows"])
+    alt_rows = sorted(str(r) for r in alt_result["rows"])
+
+    if primary_rows == alt_rows:
+        return {"checked": True, "agrees": True,
+                "detail": "Two independent queries produced identical results"}
+    else:
+        return {"checked": True, "agrees": False,
+                "detail": (f"Results differ: primary returned "
+                           f"{primary_result['row_count']} rows, "
+                           f"alternative returned {alt_result['row_count']} rows"),
+                "alt_sql": alt_sql}
 
 # Quick test: one good match, and one deliberately mismatched SQL
 if __name__ == "__main__":
@@ -214,3 +292,24 @@ if __name__ == "__main__":
         alignment_similarity=0.14,
         sanity_flags=["Result is empty — a filter value might not match the data"],
     ))
+
+    # --- Multi-query validation tests ---
+    print("\n" + "=" * 50)
+    print("MULTI-QUERY VALIDATION TESTS")
+    print("=" * 50)
+
+    # A complex question (has a GROUP BY) -> validation should run
+    q1 = "Which 3 countries generate the most revenue?"
+    sql1 = ("SELECT BillingCountry, SUM(Total) AS TotalRevenue\n"
+            "FROM Invoice\nGROUP BY BillingCountry\n"
+            "ORDER BY TotalRevenue DESC\nLIMIT 3;")
+    res1 = run_readonly(sql1)
+    print(f"\nQ: {q1}")
+    print(" ", multi_query_validation(q1, sql1, res1))
+
+    # A simple question (no JOIN/GROUP BY) -> validation should be skipped
+    q2 = "How many customers are there?"
+    sql2 = "SELECT COUNT(*) FROM Customer;"
+    res2 = run_readonly(sql2)
+    print(f"\nQ: {q2}")
+    print(" ", multi_query_validation(q2, sql2, res2))
