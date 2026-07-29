@@ -103,6 +103,47 @@ def sanity_check_result(execution_result, sql):
 
     return flags
 
+def compute_confidence(syntax_valid, alignment_similarity, sanity_flags):
+    """Combine independent signals into a single confidence score (0 to 1).
+
+    Signals:
+      - syntax_valid: bool, did the SQL pass the syntax/type check?
+      - alignment_similarity: float 0-1, how well the SQL back-translates
+        to the original question (from Madde 1)
+      - sanity_flags: list of warnings from the sanity checks (Madde 2);
+        more flags -> lower confidence
+
+    Returns a dict with the final score and a breakdown of each part,
+    so the score is explainable rather than a mysterious number."""
+
+    # 1. Syntax signal: valid = full marks, invalid = zero.
+    syntax_score = 1.0 if syntax_valid else 0.0
+
+    # 2. Alignment signal: use the similarity directly (already 0-1).
+    alignment_score = float(alignment_similarity)
+
+    # 3. Sanity signal: start at 1.0, subtract a penalty per flag.
+    #    Each flag costs 0.25; floor at 0 so it never goes negative.
+    sanity_score = max(0.0, 1.0 - 0.25 * len(sanity_flags))
+
+    # Weighted combination. Alignment matters most (does the SQL answer
+    # the right question?), then sanity, then syntax as a basic gate.
+    weights = {"syntax": 0.2, "alignment": 0.5, "sanity": 0.3}
+    final = (
+        weights["syntax"] * syntax_score
+        + weights["alignment"] * alignment_score
+        + weights["sanity"] * sanity_score
+    )
+
+    return {
+        "confidence": round(final, 3),
+        "breakdown": {
+            "syntax_score": round(syntax_score, 3),
+            "alignment_score": round(alignment_score, 3),
+            "sanity_score": round(sanity_score, 3),
+        },
+    }
+
 # Quick test: one good match, and one deliberately mismatched SQL
 if __name__ == "__main__":
     # Case 1: the SQL genuinely answers the question -> should align
@@ -152,3 +193,24 @@ if __name__ == "__main__":
     }
     print("\nAll-NULL column result:")
     print("  flags:", sanity_check_result(null_col, "SELECT Artist.Name, Album.Title FROM Artist JOIN Album ..."))
+
+    # --- Confidence scoring tests ---
+    print("\n" + "=" * 50)
+    print("CONFIDENCE SCORING TESTS")
+    print("=" * 50)
+
+    # A good query: valid syntax, high alignment, no flags -> high confidence
+    print("\nGood query:")
+    print(" ", compute_confidence(
+        syntax_valid=True,
+        alignment_similarity=0.98,
+        sanity_flags=[],
+    ))
+
+    # A suspicious query: valid syntax, but low alignment and one flag
+    print("\nSuspicious query (wrong question + empty result):")
+    print(" ", compute_confidence(
+        syntax_valid=True,
+        alignment_similarity=0.14,
+        sanity_flags=["Result is empty — a filter value might not match the data"],
+    ))
