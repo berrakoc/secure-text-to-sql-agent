@@ -57,6 +57,51 @@ def verify_sql_matches_question(original_question, sql):
         "aligned": aligned,
     }
 
+def sanity_check_result(execution_result, sql):
+    """Run cheap, LLM-free sanity checks on an execution result.
+    These don't prove correctness — they raise flags worth lowering
+    confidence for. Returns a list of human-readable warning strings
+    (empty list means nothing looked suspicious).
+
+    execution_result is the dict returned by run_readonly():
+    it has columns, rows, row_count, etc."""
+
+    flags = []
+
+    rows = execution_result.get("rows", [])
+    columns = execution_result.get("columns", [])
+    row_count = execution_result.get("row_count", 0)
+
+    # Check 1: empty result set. Sometimes correct, but often a wrong filter.
+    if row_count == 0:
+        flags.append("Result is empty — a filter value might not match the data")
+
+    # Check 2: aggregate queries (COUNT/SUM/AVG) should usually return
+    # a single row. Detect the aggregate case and sanity-check its shape/value.
+    sql_upper = sql.upper()
+    is_aggregate = any(fn in sql_upper for fn in ("COUNT(", "SUM(", "AVG("))
+    has_group_by = "GROUP BY" in sql_upper
+
+    if is_aggregate and not has_group_by:
+        # An aggregate without GROUP BY should collapse to one row.
+        if row_count > 1:
+            flags.append(
+                f"Aggregate query returned {row_count} rows (expected 1)"
+            )
+        # If it's a single numeric value, check it isn't negative.
+        if row_count == 1 and len(rows[0]) == 1:
+            value = rows[0][0]
+            if isinstance(value, (int, float)) and value < 0:
+                flags.append(f"Aggregate value is negative ({value})")
+
+    # Check 3: a column that is entirely NULL often signals a bad JOIN.
+    if rows:
+        for col_index, col_name in enumerate(columns):
+            all_null = all(row[col_index] is None for row in rows)
+            if all_null:
+                flags.append(f"Column '{col_name}' is entirely NULL — possible bad JOIN")
+
+    return flags
 
 # Quick test: one good match, and one deliberately mismatched SQL
 if __name__ == "__main__":
@@ -79,3 +124,31 @@ if __name__ == "__main__":
     )
     for k, v in result.items():
         print(f"  {k}: {v}")
+
+    # --- Sanity check tests ---
+    print("\n" + "=" * 50)
+    print("SANITY CHECK TESTS")
+    print("=" * 50)
+
+    # A normal, healthy result: one row, positive count
+    healthy = {
+        "columns": ["COUNT(*)"],
+        "rows": [(59,)],
+        "row_count": 1,
+    }
+    print("\nHealthy result:")
+    print("  flags:", sanity_check_result(healthy, "SELECT COUNT(*) FROM Customer;"))
+
+    # An empty result (suspicious)
+    empty = {"columns": ["Total"], "rows": [], "row_count": 0}
+    print("\nEmpty result:")
+    print("  flags:", sanity_check_result(empty, "SELECT SUM(Total) FROM Invoice WHERE BillingCountry = 'Wakanda';"))
+
+    # An all-NULL column (bad JOIN signal)
+    null_col = {
+        "columns": ["Name", "Title"],
+        "rows": [("AC/DC", None), ("Accept", None)],
+        "row_count": 2,
+    }
+    print("\nAll-NULL column result:")
+    print("  flags:", sanity_check_result(null_col, "SELECT Artist.Name, Album.Title FROM Artist JOIN Album ..."))
