@@ -55,7 +55,7 @@ The project is split into focused modules:
 | `ui/` | Streamlit web interface |
 | `eval/` | Golden dataset and the evaluation engine |
 
-The core logic lives in `pipeline.py`, which ties every stage together. The API and UI are thin layers on top of it — the same logic runs whether you call it from the command line, over HTTP, or through the web interface.
+#### The core logic lives in `pipeline.py`, which ties every stage together. The API and UI are thin layers on top of it — the same logic runs whether you call it from the command line, over HTTP, or through the web interface.
 ---
 
 ## Getting started
@@ -134,3 +134,66 @@ This runs all 51 test cases and the guardrail checks, then prints a summary.
 ## A note on the database
 
 This project uses SQLite for speed and simplicity — the whole database is a single file, with no server to set up. Because all database access goes through SQLAlchemy, moving to PostgreSQL for production would mean changing one connection string, not rewriting the code.
+
+---
+
+## Evaluation
+
+The system is tested against a hand-built golden dataset of 51 questions, each with a verified correct answer. The questions cover seven categories, from simple lookups to deliberately tricky cases.
+
+Accuracy is measured by **execution match**: does the system's result match the correct answer, regardless of how the SQL is written? This is fairer than comparing SQL text, since there are many correct ways to write the same query.
+
+### Results by category
+
+| Category | Score | What it tests |
+|----------|-------|---------------|
+| Simple lookups | 10/10 (100%) | Basic counts and listings |
+| Aggregations | 8/8 (100%) | `GROUP BY`, `SUM`, `AVG` |
+| Joins | 10/10 (100%) | Multi-table queries |
+| Date filters | 5/5 (100%) | Filtering by year and quarter |
+| Ambiguous | 5/5 (100%) | Should ask, not guess |
+| Unanswerable | 5/5 (100%) | Data not in the database |
+| Hard (adversarial) | 6/8 (75%) | Nested aggregation, tricky wording |
+| **Overall** | **49/51 (96%)** | |
+
+### Safety
+
+Every destructive query in the test set was blocked:
+
+| | Result |
+|--|--------|
+| Dangerous queries blocked | **7/7 (100%)** |
+
+This includes `DROP`, `DELETE`, `INSERT`, `UPDATE`, `ALTER`, `TRUNCATE`, and stacked-query injection attempts.
+
+### What the failures taught me
+
+The two failures are in the hardest category, and both are informative rather than random:
+
+- **Nested aggregation.** For "how many customers have spent more than $40?", the system correctly found the right customers but *listed* them instead of *counting* them. It struggles to wrap an aggregation inside another one.
+- **Subtle ambiguity.** For "total spending of customers in the USA," the system picked one interpretation instead of asking which one the user meant (billing country vs. customer country). Its ambiguity detection catches obvious cases but misses subtle ones.
+
+I kept both failures in the results rather than hiding them. Knowing exactly where and why a system fails is more useful than a perfect-looking score.
+
+---
+
+## Tech stack
+
+| Area | Tools |
+|------|-------|
+| Language | Python 3.11 |
+| LLM | OpenAI (`gpt-4o-mini`), embeddings for table retrieval |
+| Database | SQLite (Chinook sample data), via SQLAlchemy |
+| API | FastAPI |
+| Interface | Streamlit |
+| SQL parsing | sqlparse |
+| Evaluation | Custom golden-dataset harness |
+
+## What I'd do next
+
+A few directions this could grow:
+
+- **Move to PostgreSQL** for a production-grade database, and add row-scan limits using its query planner.
+- **Improve nested-aggregation handling** — the main weakness the evaluation revealed.
+- **Sharpen ambiguity detection** to catch subtle cases, not just obvious ones.
+- **Feed real usage back in** — the feedback loop already collects correct/incorrect labels that could become new test cases and few-shot examples.
